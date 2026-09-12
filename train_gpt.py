@@ -1402,6 +1402,8 @@ class GPT(nn.Module):
 
     def quantize_mlp_fp8(self, bootstrap_down=False):
         """Refresh FP8 copies of both MLP projections after optimizer steps."""
+        if os.environ.get("DISABLE_FP8", False) or torch.cuda.get_device_capability() < (8, 9):
+            return
         E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
         with torch.no_grad():
             if not hasattr(self, "_mlp_up_proj_f8"):

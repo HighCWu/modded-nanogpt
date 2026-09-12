@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -1176,14 +1177,21 @@ __global__ void ce_fwd_bwd_kernel(
 # the loss kernel source and training algorithm remain unchanged.
 _compile_major, _compile_minor = torch.cuda.get_device_capability()
 _compile_capability = f"{_compile_major}{_compile_minor}"
-ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
-    CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
-    "ce_fwd_bwd_kernel",
-    compute_capability=_compile_capability,
-    cuda_include_dirs=["/usr/local/cuda/include/"],
-    nvcc_options=["-lineinfo", "--use_fast_math"],
-)
-ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+_fused_ce_available = (_compile_major, _compile_minor) >= (8, 9)
+if _fused_ce_available:
+    ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
+        CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
+        "ce_fwd_bwd_kernel",
+        compute_capability=_compile_capability,
+        cuda_include_dirs=["/usr/local/cuda/include/"],
+        nvcc_options=["-lineinfo", "--use_fast_math"],
+    )
+    ce_fwd_bwd_kernel.set_shared_memory_config(CE_KERNEL_VOCAB_SIZE * 2)
+else:
+    # A100 (sm_80) cannot assemble the e4m3x2/e5m2x2 conversions used by the
+    # fused H100 loss kernel. The regular PyTorch fallback below keeps the
+    # mathematical baseline runnable without emitting unsupported FP8 code.
+    ce_fwd_bwd_kernel = None
 
 @torch.library.custom_op("nanogpt::ce_fwd_bwd", mutates_args={"losses", "grad_input"})
 def ce_fwd_bwd(
@@ -1211,7 +1219,7 @@ def ce_fwd_bwd(
         shared_mem=CE_KERNEL_VOCAB_SIZE * 2,
     )
 
-class FusedSoftcappedCrossEntropy(torch.autograd.Function):
+class _FusedSoftcappedCrossEntropy(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, targets, mtp_weights, prefix_targets, prefix_weight, lm_head_weight, x_s, w_s, grad_s, grad_scale, A=23.0, B=5.0, C=7.5):
 
@@ -1296,3 +1304,65 @@ class FusedSoftcappedCrossEntropy(torch.autograd.Function):
         )
 
         return grad_x, None, None, None, None, grad_w, None, None, None
+
+
+def _softcapped_cross_entropy_fallback(
+    x,
+    targets,
+    mtp_weights,
+    prefix_targets,
+    prefix_weight,
+    lm_head_weight,
+    x_s,
+    w_s,
+    grad_s,
+    grad_scale,
+    A=23.0,
+    B=5.0,
+    C=7.5,
+):
+    """A100-safe replacement for the fused FP8 cross-entropy kernel.
+
+    A100 cannot execute the FP8 conversion instructions used by the fused
+    kernel. Keep the same softcap, MTP target shifts, and prefix loss while
+    using a BF16 matmul and ordinary autograd. The caller supplies the
+    accumulation scale when it reduces the returned per-token losses.
+    """
+    del x_s, w_s, grad_s, grad_scale
+
+    raw_logits = x @ lm_head_weight.type_as(x)
+    logits = A * torch.sigmoid((raw_logits.float() + B) / C)
+    lse = torch.logsumexp(logits, dim=-1)
+    n_rows, vocab_size = logits.shape
+    losses = lse * 0
+
+    if mtp_weights is None:
+        mtp_weights = logits.new_tensor([1.0], dtype=torch.float32)
+    for offset in range(mtp_weights.shape[0]):
+        count = n_rows - offset
+        if count <= 0:
+            break
+        target_slice = targets[offset:offset + count]
+        valid = (target_slice >= 0) & (target_slice < vocab_size)
+        safe_targets = target_slice.clamp(0, vocab_size - 1)
+        target_logits = logits[:count].gather(1, safe_targets[:, None]).squeeze(1)
+        term = lse[:count] - target_logits
+        losses[:count] = losses[:count] + mtp_weights[offset] * term * valid
+
+    if prefix_targets is not None and prefix_weight is not None:
+        valid = (prefix_targets >= 0) & (prefix_targets < vocab_size)
+        safe_targets = prefix_targets.clamp(0, vocab_size - 1)
+        target_logits = logits.gather(1, safe_targets[:, None]).squeeze(1)
+        prefix_term = (lse - target_logits) * valid
+        losses = losses + prefix_weight.reshape(-1)[0] * prefix_term
+
+    return losses
+
+
+if _fused_ce_available:
+    FusedSoftcappedCrossEntropy = _FusedSoftcappedCrossEntropy
+else:
+    class FusedSoftcappedCrossEntropy:
+        @staticmethod
+        def apply(*args, **kwargs):
+            return _softcapped_cross_entropy_fallback(*args, **kwargs)
