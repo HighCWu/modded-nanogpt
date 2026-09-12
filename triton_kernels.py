@@ -1306,7 +1306,7 @@ class _FusedSoftcappedCrossEntropy(torch.autograd.Function):
         return grad_x, None, None, None, None, grad_w, None, None, None
 
 
-def _softcapped_cross_entropy_fallback(
+def _softcapped_cross_entropy_formula(
     x,
     targets,
     mtp_weights,
@@ -1321,12 +1321,11 @@ def _softcapped_cross_entropy_fallback(
     B=5.0,
     C=7.5,
 ):
-    """A100-safe replacement for the fused FP8 cross-entropy kernel.
+    """A100-safe softcapped cross-entropy equations.
 
     A100 cannot execute the FP8 conversion instructions used by the fused
     kernel. Keep the same softcap, MTP target shifts, and prefix loss while
-    using a BF16 matmul and ordinary autograd. The caller supplies the
-    accumulation scale when it reduces the returned per-token losses.
+    using a BF16 matmul.
     """
     del x_s, w_s, grad_s, grad_scale
 
@@ -1359,18 +1358,90 @@ def _softcapped_cross_entropy_fallback(
     return losses
 
 
+class _A100SoftcappedCrossEntropy(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, targets, mtp_weights, prefix_targets, prefix_weight,
+                lm_head_weight, x_s, w_s, grad_s, grad_scale, A, B, C):
+        if mtp_weights is None:
+            mtp_weights = x.new_tensor([1.0], dtype=torch.float32)
+        if prefix_targets is None:
+            prefix_targets = torch.full(
+                (targets.numel(),), -1, dtype=torch.int64, device=targets.device
+            )
+        if prefix_weight is None:
+            prefix_weight = x.new_zeros(1, dtype=torch.float32)
+        with torch.no_grad():
+            losses = _softcapped_cross_entropy_formula(
+                x, targets, mtp_weights, prefix_targets, prefix_weight,
+                lm_head_weight, x_s, w_s, grad_s, grad_scale, A, B, C,
+            )
+        ctx.save_for_backward(
+            x, targets, mtp_weights, prefix_targets, prefix_weight, lm_head_weight
+        )
+        ctx.params = (x_s, w_s, grad_s, grad_scale, A, B, C)
+        return losses
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, targets, mtp_weights, prefix_targets, prefix_weight, lm_head_weight = ctx.saved_tensors
+        x_s, w_s, grad_s, grad_scale, A, B, C = ctx.params
+        with torch.enable_grad():
+            x_recomputed = x.detach().requires_grad_(x.requires_grad)
+            weight_recomputed = lm_head_weight.detach().requires_grad_(lm_head_weight.requires_grad)
+            losses = _softcapped_cross_entropy_formula(
+                x_recomputed, targets, mtp_weights, prefix_targets, prefix_weight,
+                weight_recomputed, x_s, w_s, grad_s, grad_scale, A, B, C,
+            )
+            grad_x, grad_weight = torch.autograd.grad(
+                losses,
+                (x_recomputed, weight_recomputed),
+                grad_outputs=grad_output,
+                allow_unused=True,
+            )
+        return (
+            grad_x, None, None, None, None, grad_weight,
+            None, None, None, None, None, None, None,
+        )
+
+
 if _fused_ce_available:
     FusedSoftcappedCrossEntropy = _FusedSoftcappedCrossEntropy
 else:
     class FusedSoftcappedCrossEntropy:
         @staticmethod
-        def apply(*args, **kwargs):
-            return _softcapped_cross_entropy_fallback(*args, **kwargs)
+        def apply(x, targets, mtp_weights, prefix_targets, prefix_weight,
+                  lm_head_weight, x_s, w_s, grad_s, grad_scale,
+                  A=23.0, B=5.0, C=7.5):
+            return _A100SoftcappedCrossEntropy.apply(
+                x, targets, mtp_weights, prefix_targets, prefix_weight,
+                lm_head_weight, x_s, w_s, grad_s, grad_scale, A, B, C,
+            )
+
+    class _A100ReLUSquareFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, W1, W2):
+            pre = torch.matmul(x, W1.transpose(-1, -2))
+            post = torch.relu(pre).square()
+            output = torch.matmul(post, W2)
+            ctx.save_for_backward(x, W1, W2, post)
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            x, W1, W2, post = ctx.saved_tensors
+            post_flat = post.reshape(-1, post.shape[-1])
+            grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
+            grad_W2 = post_flat.transpose(0, 1) @ grad_flat
+            grad_pre = torch.matmul(grad_output, W2.transpose(-1, -2))
+            grad_pre = grad_pre * (2 * torch.sqrt(post))
+            grad_pre_flat = grad_pre.reshape(-1, grad_pre.shape[-1])
+            x_flat = x.reshape(-1, x.shape[-1])
+            grad_W1 = grad_pre_flat.transpose(0, 1) @ x_flat
+            grad_x = torch.matmul(grad_pre, W1)
+            return grad_x, grad_W1, grad_W2
 
     class FusedLinearReLUSquareFunction:
         @staticmethod
         def apply(x, W1, W2, *_):
-            """A100-safe autograd path for the BF16 ReLU-squared MLP."""
-            pre = torch.matmul(x, W1.transpose(-1, -2))
-            post = torch.relu(pre).square()
-            return torch.matmul(post, W2)
+            """A100-safe checkpoint-style BF16 ReLU-squared MLP."""
+            return _A100ReLUSquareFunction.apply(x, W1, W2)
