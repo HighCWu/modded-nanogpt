@@ -1170,10 +1170,16 @@ __global__ void ce_fwd_bwd_kernel(
 }
 """
 
+# The upstream speedrun is tuned for H100 and hard-codes sm_90 here. Resolve
+# the target from the active device so the pinned baseline can also boot on
+# our A100 (sm_80) machine. This is a hardware compatibility change only;
+# the loss kernel source and training algorithm remain unchanged.
+_compile_major, _compile_minor = torch.cuda.get_device_capability()
+_compile_capability = f"{_compile_major}{_compile_minor}"
 ce_fwd_bwd_kernel = torch.cuda._compile_kernel(
     CE_KERNEL_DECLS + CE_KERNEL_SOURCE,
     "ce_fwd_bwd_kernel",
-    compute_capability="90",
+    compute_capability=_compile_capability,
     cuda_include_dirs=["/usr/local/cuda/include/"],
     nvcc_options=["-lineinfo", "--use_fast_math"],
 )
