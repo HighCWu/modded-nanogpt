@@ -1366,3 +1366,11 @@ else:
         @staticmethod
         def apply(*args, **kwargs):
             return _softcapped_cross_entropy_fallback(*args, **kwargs)
+
+    class FusedLinearReLUSquareFunction:
+        @staticmethod
+        def apply(x, W1, W2, *_):
+            """A100-safe autograd path for the BF16 ReLU-squared MLP."""
+            pre = torch.matmul(x, W1.transpose(-1, -2))
+            post = torch.relu(pre).square()
+            return torch.matmul(post, W2)
